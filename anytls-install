@@ -1,0 +1,133 @@
+#!/bin/bash
+
+# AnyTLS-Go 自动升级与管理脚本
+# 仓库: https://github.com/anytls/anytls-go
+
+# --- 自动获取 GitHub 最新版本号 ---
+echo "正在检查 AnyTLS-Go 官方最新版本..."
+ANYTLS_VERSION=$(curl -s "https://api.github.com/repos/anytls/anytls-go/releases/latest" | grep -Po '"tag_name": "\K.*?(?=")')
+
+if [ -z "$ANYTLS_VERSION" ]; then
+    ANYTLS_VERSION="v0.0.11" # 无法连接 API 时的保底版本
+    echo "提示：无法获取最新版本号，将安装/升级至 $ANYTLS_VERSION"
+else
+    echo "检测到官方最新版本为: $ANYTLS_VERSION"
+fi
+
+# --- 全局变量 ---
+BASE_URL="https://github.com/anytls/anytls-go/releases/download"
+INSTALL_DIR_TEMP="/tmp/anytls_install_$$"
+BIN_DIR="/usr/local/bin"
+SERVER_BINARY_NAME="anytls-server"
+SERVER_BINARY_PATH="${BIN_DIR}/${SERVER_BINARY_NAME}"
+SERVICE_FILE="/etc/systemd/system/anytls-server.service"
+
+# --- 内部函数 ---
+check_command() { command -v "$1" >/dev/null 2>&1; }
+
+# 获取公网 IP
+get_public_ip() {
+    local ip=$(curl -s --max-time 5 --ipv4 https://api.ipify.org || curl -s --max-time 5 --ipv4 https://ifconfig.me)
+    echo "$ip"
+}
+
+# URL 编码
+urlencode() {
+    local string="${1}"
+    local strlen=${#string}
+    local encoded=""
+    for (( pos=0 ; pos<strlen ; pos++ )); do
+       c=${string:$pos:1}
+       case "$c" in
+          [-_.~a-zA-Z0-9] ) o="${c}" ;;
+          * ) printf -v o '%%%02x' "'$c"
+       esac
+       encoded+="${o}"
+    done
+    echo "${encoded}"
+}
+
+# --- 核心操作 ---
+do_install() {
+    [ "$(id -u)" -ne 0 ] && echo "错误: 必须使用 root 权限运行" && exit 1
+    
+    # 尝试读取现有配置
+    local OLD_PORT=$(grep -Po 'ExecStart=.*-l 0\.0\.0\.0:\K[0-9]+' "${SERVICE_FILE}" 2>/dev/null)
+    
+    echo "--- AnyTLS-Go 配置 ---"
+    read -r -p "请输入端口 (默认 ${OLD_PORT:-8443}): " ANYTLS_PORT
+    ANYTLS_PORT=${ANYTLS_PORT:-${OLD_PORT:-8443}}
+    
+    read -r -p "请输入服务密码 (必填): " ANYTLS_PASSWORD
+    [ -z "$ANYTLS_PASSWORD" ] && echo "错误: 密码不能为空" && exit 1
+
+    # 安装基础依赖
+    echo "正在安装依赖..."
+    if check_command apt-get; then
+        apt-get update -qq && apt-get install -y -qq wget unzip curl qrencode
+    elif check_command yum; then
+        yum install -y -q wget unzip curl qrencode
+    fi
+
+    # 架构识别
+    ARCH=$(uname -m)
+    [ "$ARCH" == "x86_64" ] && ANYTLS_ARCH="amd64"
+    [ "$ARCH" == "aarch64" ] || [ "$ARCH" == "arm64" ] && ANYTLS_ARCH="arm64"
+    
+    # 下载与替换
+    FILENAME="anytls_${ANYTLS_VERSION#v}_linux_${ANYTLS_ARCH}.zip"
+    mkdir -p "$INSTALL_DIR_TEMP"
+    wget -q -O "${INSTALL_DIR_TEMP}/${FILENAME}" "${BASE_URL}/${ANYTLS_VERSION}/${FILENAME}"
+    unzip -q -o "${INSTALL_DIR_TEMP}/${FILENAME}" -d "$INSTALL_DIR_TEMP"
+    
+    systemctl stop anytls-server 2>/dev/null
+    mv "${INSTALL_DIR_TEMP}/${SERVER_BINARY_NAME}" "${SERVER_BINARY_PATH}"
+    chmod +x "${SERVER_BINARY_PATH}"
+
+    # 创建服务
+    cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=AnyTLS Server Service
+After=network.target
+[Service]
+Type=simple
+User=root
+ExecStart=${SERVER_BINARY_PATH} -l 0.0.0.0:${ANYTLS_PORT} -p "${ANYTLS_PASSWORD}"
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable anytls-server
+    systemctl restart anytls-server
+    
+    echo "-----------------------------------------------"
+    echo "✅ AnyTLS-Go 已成功安装/升级至 ${ANYTLS_VERSION}"
+    show_qr "$ANYTLS_PORT" "$ANYTLS_PASSWORD"
+}
+
+show_qr() {
+    local ip=$(get_public_ip)
+    local port=$1
+    local pass=$2
+    local encoded_pass=$(urlencode "$pass")
+    local remarks=$(urlencode "AnyTLS-Server")
+    local uri="anytls://${encoded_pass}@${ip}:${port}?allowInsecure=true#${remarks}"
+    
+    echo "服务器 IP: $ip"
+    echo "服务端口: $port"
+    echo "分享链接: $uri"
+    echo "--- 二维码 ---"
+    qrencode -t ANSIUTF8 -m 1 "${uri}"
+}
+
+# --- 菜单指令 ---
+case "$1" in
+    install) do_install ;;
+    status) systemctl status anytls-server ;;
+    stop) systemctl stop anytls-server ;;
+    restart) systemctl restart anytls-server ;;
+    log) journalctl -u anytls-server -f ;;
+    *) echo "用法: $0 {install|status|stop|restart|log}" ;;
+esac
