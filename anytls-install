@@ -1,21 +1,20 @@
 #!/bin/bash
 
-# AnyTLS-Go 服务端一键管理脚本 (自动更新增强版)
+# AnyTLS-Go 全功能一键管理脚本 (支持自动升级)
 # 仓库: https://github.com/anytls/anytls-go
 
 # --- 自动获取 GitHub 最新版本号 ---
 echo "正在检查 AnyTLS-Go 官方最新版本..."
-# 增加 -k 选项防止某些系统证书过期导致无法连接
-ANYTLS_VERSION=$(curl -sk "https://api.github.com/repos/anytls/anytls-go/releases/latest" | grep -Po '"tag_name": "\K.*?(?=")')
+ANYTLS_VERSION=$(curl -s "https://api.github.com/repos/anytls/anytls-go/releases/latest" | grep -Po '"tag_name": "\K.*?(?=")')
 
 if [ -z "$ANYTLS_VERSION" ]; then
     ANYTLS_VERSION="v0.0.11" 
-    echo "提示：无法连接 GitHub API，将安装保底版本 $ANYTLS_VERSION"
+    echo "提示：无法连接 API，将尝试安装保底版本 $ANYTLS_VERSION"
 else
     echo "检测到官方最新版本为: $ANYTLS_VERSION"
 fi
 
-# --- 全局配置参数 ---
+# --- 全局配置 ---
 BASE_URL="https://github.com/anytls/anytls-go/releases/download"
 INSTALL_DIR_TEMP="/tmp/anytls_install_$$"
 BIN_DIR="/usr/local/bin"
@@ -35,7 +34,7 @@ urlencode() {
        c=${string:$pos:1}
        case "$c" in
           [-_.~a-zA-Z0-9] ) o="${c}" ;;
-          * ) printf -v o '%%%02x' "$c"
+          * ) printf -v o '%%%02x' "'$c"
        esac
        encoded+="${o}"
     done
@@ -43,64 +42,59 @@ urlencode() {
 }
 
 get_public_ip() {
-    local ip=$(curl -sk --max-time 8 --ipv4 https://api.ipify.org || curl -sk --max-time 8 --ipv4 https://ifconfig.me)
+    local ip=$(curl -s --max-time 8 --ipv4 https://api.ipify.org || curl -s --max-time 8 --ipv4 https://ifconfig.me)
     echo "$ip"
 }
 
-# --- 核心功能 ---
+# --- 核心菜单功能 ---
+
 do_install() {
-    [ "$(id -u)" -ne 0 ] && echo "错误: 请使用 sudo 运行" && exit 1
+    [ "$(id -u)" -ne 0 ] && echo "错误: 必须使用 sudo 运行" && exit 1
     
-    # 尝试从现有服务读取旧端口
+    # 自动提取旧配置
     local OLD_PORT=$(grep -Po 'ExecStart=.*-l 0\.0\.0\.0:\K[0-9]+' "${SERVICE_FILE}" 2>/dev/null)
-    
-    echo "--- AnyTLS-Go 服务配置 ---"
+    local OLD_PASS=$(grep -Po 'ExecStart=.*-p "\K[^"]+' "${SERVICE_FILE}" 2>/dev/null || grep -Po 'ExecStart=.*-p \K[^ ]+' "${SERVICE_FILE}" 2>/dev/null)
+
+    echo "开始安装/更新 AnyTLS-Go (版本: ${ANYTLS_VERSION})"
     read -r -p "请输入监听端口 (默认 ${OLD_PORT:-8443}): " ANYTLS_PORT
     ANYTLS_PORT=${ANYTLS_PORT:-${OLD_PORT:-8443}}
     
-    read -r -p "请输入服务密码 (必填): " ANYTLS_PASSWORD
-    if [ -z "$ANYTLS_PASSWORD" ]; then echo "错误: 密码不能为空"; exit 1; fi
+    read -r -p "请输入服务密码 (默认 ${OLD_PASS:-必填}): " ANYTLS_PASSWORD
+    ANYTLS_PASSWORD=${ANYTLS_PASSWORD:-$OLD_PASS}
+    [ -z "$ANYTLS_PASSWORD" ] && echo "错误: 密码不能为空" && exit 1
 
-    # 安装依赖
-    if check_command apt-get; then
-        apt-get update -qq && apt-get install -y -qq wget unzip curl qrencode
-    elif check_command yum; then
-        yum install -y -q wget unzip curl qrencode
-    fi
-
-    # 架构检测
-    local ARCH=$(uname -m)
+    # 依赖与架构
+    check_command wget || (apt-get update && apt-get install -y wget unzip curl qrencode || yum install -y wget unzip curl qrencode)
+    
+    ARCH=$(uname -m)
     case $ARCH in
-        x86_64) ANYTLS_ARCH="amd64" ;;
+        x86_64|amd64) ANYTLS_ARCH="amd64" ;;
         aarch64|arm64) ANYTLS_ARCH="arm64" ;;
         *) echo "错误: 不支持的架构 $ARCH"; exit 1 ;;
     esac
 
-    # 下载
-    local FILENAME="anytls_${ANYTLS_VERSION#v}_linux_${ANYTLS_ARCH}.zip"
+    # 下载替换
+    FILENAME="anytls_${ANYTLS_VERSION#v}_linux_${ANYTLS_ARCH}.zip"
     mkdir -p "$INSTALL_DIR_TEMP"
-    echo "正在从 GitHub 下载最新组件..."
     wget -q -O "${INSTALL_DIR_TEMP}/${FILENAME}" "${BASE_URL}/${ANYTLS_VERSION}/${FILENAME}"
     unzip -q -o "${INSTALL_DIR_TEMP}/${FILENAME}" -d "$INSTALL_DIR_TEMP"
-
-    # 替换程序
+    
     systemctl stop "${SERVICE_FILE_BASENAME}" 2>/dev/null
     mv "${INSTALL_DIR_TEMP}/${SERVER_BINARY_NAME}" "${SERVER_BINARY_PATH}"
     chmod +x "${SERVER_BINARY_PATH}"
 
-    # 创建服务 (恢复完整日志输出定义，解决版本号显示问题)
+    # 写入服务
     cat > "$SERVICE_FILE" << EOF
 [Unit]
-Description=AnyTLS Server Service (Version ${ANYTLS_VERSION})
-After=network.target network-online.target
-Wants=network-online.target
+Description=AnyTLS Server Service
+After=network.target
 
 [Service]
 Type=simple
 User=root
 ExecStart=${SERVER_BINARY_PATH} -l 0.0.0.0:${ANYTLS_PORT} -p "${ANYTLS_PASSWORD}"
 Restart=on-failure
-RestartSec=5s
+RestartSec=10s
 StandardOutput=journal
 StandardError=journal
 
@@ -111,10 +105,18 @@ EOF
     systemctl daemon-reload
     systemctl enable "${SERVICE_FILE_BASENAME}"
     systemctl restart "${SERVICE_FILE_BASENAME}"
-
-    echo "-----------------------------------------------"
-    echo "🎉 安装/升级完成！版本: ${ANYTLS_VERSION}"
+    
+    echo "🎉 安装/更新成功！"
     show_qr "$ANYTLS_PORT" "$ANYTLS_PASSWORD"
+}
+
+do_uninstall() {
+    [ "$(id -u)" -ne 0 ] && echo "错误: 必须使用 sudo 运行" && exit 1
+    systemctl stop "${SERVICE_FILE_BASENAME}"
+    systemctl disable "${SERVICE_FILE_BASENAME}"
+    rm -f "${SERVICE_FILE}" "${SERVER_BINARY_PATH}"
+    systemctl daemon-reload
+    echo "AnyTLS 已彻底从系统中移除。"
 }
 
 show_qr() {
@@ -122,25 +124,45 @@ show_qr() {
     local encoded_pass=$(urlencode "$2")
     local remarks=$(urlencode "AnyTLS-${1}")
     local uri="anytls://${encoded_pass}@${ip}:${1}?allowInsecure=true#${remarks}"
-    echo "客户端链接: $uri"
+    echo "-----------------------------------------------"
+    echo "配置链接: $uri"
     qrencode -t ANSIUTF8 -m 1 "${uri}"
 }
 
-# --- 菜单控制 ---
+show_help_menu() {
+    echo "==============================="
+    echo "   AnyTLS-Go 服务端管理脚本"
+    echo "==============================="
+    echo "用法: $0 [命令]"
+    echo ""
+    echo "可用命令:"
+    printf "  %-12s %s\n" "install" "安装或自动更新至最新版 (需要sudo)"
+    printf "  %-12s %s\n" "uninstall" "彻底卸载 AnyTLS 服务 (需要sudo)"
+    printf "  %-12s %s\n" "start" "启动服务"
+    printf "  %-12s %s\n" "stop" "停止服务"
+    printf "  %-12s %s\n" "restart" "重启服务"
+    printf "  %-12s %s\n" "status" "查看运行状态与版本"
+    printf "  %-12s %s\n" "log" "实时查看日志 (Ctrl+C退出)"
+    printf "  %-12s %s\n" "qr" "重新显示配置二维码"
+    printf "  %-12s %s\n" "help" "显示此帮助菜单"
+    echo ""
+}
+
+# --- 主程序逻辑 ---
 case "$1" in
     install) do_install ;;
-    # 这里的 -l 和 --no-pager 确保版本号日志能完整显示
-    status) systemctl status "${SERVICE_FILE_BASENAME}" -l --no-pager ;;
+    uninstall) do_uninstall ;;
+    start) systemctl start "${SERVICE_FILE_BASENAME}" && echo "服务已启动" ;;
     stop) systemctl stop "${SERVICE_FILE_BASENAME}" && echo "服务已停止" ;;
     restart) systemctl restart "${SERVICE_FILE_BASENAME}" && echo "服务已重启" ;;
+    status) systemctl status "${SERVICE_FILE_BASENAME}" -l --no-pager ;;
     log) journalctl -u "${SERVICE_FILE_BASENAME}" -f ;;
-    qr) 
+    qr)
         PORT=$(grep -Po 'ExecStart=.*-l 0\.0\.0\.0:\K[0-9]+' "${SERVICE_FILE}" 2>/dev/null)
-        PASS=$(grep -Po 'ExecStart=.*-p "\K[^"]+' "${SERVICE_FILE}" 2>/dev/null || grep -Po 'ExecStart=.*-p \K[^ ]+' "${SERVICE_FILE}")
-        show_qr "$PORT" "$PASS" 
+        PASS=$(grep -Po 'ExecStart=.*-p "\K[^"]+' "${SERVICE_FILE}" 2>/dev/null || grep -Po 'ExecStart=.*-p \K[^ ]+' "${SERVICE_FILE}" 2>/dev/null)
+        [ -n "$PORT" ] && show_qr "$PORT" "$PASS" || echo "错误: 未找到服务配置"
         ;;
-    *) echo "用法: $0 {install|status|stop|restart|log|qr}" ;;
+    *) show_help_menu ;;
 esac
 
-# 清理
 rm -rf "$INSTALL_DIR_TEMP" 2>/dev/null
