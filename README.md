@@ -1,4 +1,5 @@
 下载，安装
+
 wget -O anytls_manager.sh https://raw.githubusercontent.com/xu348025782/anytls-install/main/anytls-install && chmod +x anytls_manager.sh && sudo ./anytls_manager.sh install
 
 执行安装（按提示输入端口和密码）：
